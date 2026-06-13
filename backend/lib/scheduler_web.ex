@@ -20,8 +20,15 @@ defmodule SchedulerWeb.Router do
     post "/tasks", TaskController, :create
     post "/tasks/:id/retry", TaskController, :retry
     post "/tasks/:id/cancel", TaskController, :cancel
+    post "/tasks/:id/notify", TaskController, :notify
     get "/stats", TaskController, :stats
     get "/nodes", TaskController, :nodes
+    get "/notifications", NotificationController, :index
+    get "/notifications/:id", NotificationController, :show
+    get "/notifications/stats/summary", NotificationController, :stats
+    post "/notifications", NotificationController, :create
+    post "/notifications/:id/confirm", NotificationController, :confirm
+    post "/notifications/:id/reject", NotificationController, :reject
   end
 end
 
@@ -48,6 +55,31 @@ defmodule SchedulerWeb.TaskController do
     json(conn, %{status: "ok"})
   end
 
+  def notify(conn, %{"id" => id} = params) do
+    owner = Map.get(params, "owner")
+    if owner do
+      Scheduler.TaskManager.notify_task(id, owner)
+      task = Enum.find(Scheduler.TaskManager.list_tasks(), &(&1.id == id))
+      notif_params = %{
+        "task_id" => id,
+        "task_name" => task && task.name || id,
+        "owner" => owner,
+        "message" => Map.get(params, "message"),
+        "priority" => Map.get(params, "priority", "medium"),
+        "deadline" => Map.get(params, "deadline"),
+        "result_summary" => Map.get(params, "result_summary"),
+        "external_contacts" => Map.get(params, "external_contacts", []),
+        "cc_list" => Map.get(params, "cc_list", [])
+      }
+      notification = Scheduler.NotificationManager.create_notification(notif_params)
+      json(conn, %{status: "ok", notification: Map.from_struct(notification)})
+    else
+      conn
+      |> put_status(:bad_request)
+      |> json(%{error: "owner is required"})
+    end
+  end
+
   def stats(conn, _params) do
     json(conn, Scheduler.TaskManager.get_stats())
   end
@@ -72,5 +104,61 @@ end
 defmodule SchedulerWeb.ErrorJSON do
   def render(template, _assigns) do
     %{errors: %{detail: Phoenix.Controller.status_message_from_template(template)}}
+  end
+end
+
+defmodule SchedulerWeb.NotificationController do
+  use Phoenix.Controller, formats: [:json]
+
+  def index(conn, params) do
+    filters = Map.take(params, ["status", "owner", "priority"])
+    notifications = Scheduler.NotificationManager.list_notifications(filters)
+    json(conn, %{notifications: Enum.map(notifications, &Map.from_struct/1)})
+  end
+
+  def show(conn, %{"id" => id}) do
+    case Scheduler.NotificationManager.get_notification(id) do
+      nil ->
+        conn
+        |> put_status(:not_found)
+        |> json(%{error: "Notification not found"})
+      notif ->
+        json(conn, %{notification: Map.from_struct(notif)})
+    end
+  end
+
+  def stats(conn, _params) do
+    json(conn, Scheduler.NotificationManager.get_stats())
+  end
+
+  def create(conn, params) do
+    with {:ok, task_id} <- Map.fetch(params, "task_id"),
+         {:ok, task_name} <- Map.fetch(params, "task_name"),
+         {:ok, owner} <- Map.fetch(params, "owner") do
+      notification = Scheduler.NotificationManager.create_notification(params)
+      Scheduler.TaskManager.notify_task(task_id, owner)
+      json(conn, %{status: "ok", notification: Map.from_struct(notification)})
+    else
+      :error ->
+        conn
+        |> put_status(:bad_request)
+        |> json(%{error: "task_id, task_name and owner are required"})
+    end
+  end
+
+  def confirm(conn, %{"id" => id} = params) do
+    remark = Map.get(params, "remark")
+    Scheduler.NotificationManager.confirm_notification(id, remark)
+    notif = Scheduler.NotificationManager.get_notification(id)
+    if notif, do: Scheduler.TaskManager.update_notification(notif.task_id, "confirmed")
+    json(conn, %{status: "ok"})
+  end
+
+  def reject(conn, %{"id" => id} = params) do
+    reason = Map.get(params, "reason")
+    Scheduler.NotificationManager.reject_notification(id, reason)
+    notif = Scheduler.NotificationManager.get_notification(id)
+    if notif, do: Scheduler.TaskManager.update_notification(notif.task_id, "rejected")
+    json(conn, %{status: "ok"})
   end
 end
